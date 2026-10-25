@@ -6,19 +6,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
-from app.db.models import (
-    Event,
-    Listing,
-    ListingImage,
-    Promotion,
-    Reel,
-    ReelMedia,
-    Swipe,
-    User,
-    UserInterest,
-    UserOnboarding,
-    WishlistItem,
-)
+from app.db.models import Listing, ListingImage, Promotion, Reel, ReelMedia, Swipe, User, WishlistItem
 from app.db.session import get_db
 from app.schemas.feed import (
     FeedItem,
@@ -122,23 +110,18 @@ async def get_feed(
         .where(Swipe.user_id == user.id, Swipe.undone_at.is_(None))
         .order_by(Swipe.created_at, Swipe.id)
     )
-    latest_action: dict[UUID, tuple[str, datetime]] = {}
-    swipe_count = 0
+    excluded: set[UUID] = set()
     for reel_id, action, created_at, _ in swipe_rows.all():
-        latest_action[reel_id] = (action, created_at)
-        swipe_count += 1
-    excluded = {
-        reel_id
-        for reel_id, (action, created_at) in latest_action.items()
-        if action in {"like", "dislike"}
-        or (action == "skip" and created_at > now - timedelta(hours=24))
-    }
-
-    interests_result = await session.execute(
-        select(UserInterest.category_id).where(UserInterest.user_id == user.id)
-    )
-    category_ids = [row[0] for row in interests_result.all()]
-    onboarding = await session.get(UserOnboarding, user.id)
+        if action in {"like", "dislike"}:
+            excluded.add(reel_id)
+        elif action == "skip":
+            swipe_at = (
+                created_at.replace(tzinfo=timezone.utc)
+                if created_at.tzinfo is None
+                else created_at
+            )
+            if swipe_at > now - timedelta(hours=24):
+                excluded.add(reel_id)
 
     candidate_query = (
         select(Reel, Listing, User)
@@ -151,23 +134,19 @@ async def get_feed(
             Listing.status == "active",
         )
     )
-    if swipe_count < 5 and category_ids and not (
-        onboarding and onboarding.interests_skipped
-    ):
-        candidate_query = candidate_query.where(Listing.category_id.in_(category_ids))
-
     candidate_result = await session.execute(
         candidate_query.order_by(
             Reel.published_at.desc().nullslast(), Reel.id.desc()
         )
     )
-    candidates = candidate_result.all()
-    if swipe_count >= 5:
-        ranked_ids = await recommend(
-            session, user.id, limit=max(len(candidates), limit)
-        )
-        rank = {reel_id: index for index, reel_id in enumerate(ranked_ids)}
-        candidates.sort(key=lambda row: rank.get(row[0].id, len(rank)))
+    candidates = [
+        row for row in candidate_result.all() if row[0].id not in excluded
+    ]
+    ranked_ids = await recommend(
+        session, user.id, limit=len(candidates), exclude_ids=list(excluded)
+    )
+    rank = {reel_id: index for index, reel_id in enumerate(ranked_ids)}
+    candidates.sort(key=lambda row: rank.get(row[0].id, len(rank)))
 
     promotion_rows = await session.scalars(
         select(Promotion.reel_id)
@@ -182,14 +161,12 @@ async def get_feed(
     organic = [row for row in candidates if row[0].id not in promoted_ids]
     promoted = [row for row in candidates if row[0].id in promoted_ids]
     ordered = []
-    while organic and len(ordered) < limit * 5:
+    while organic:
         ordered.extend(organic[:4])
         del organic[:4]
-        if promoted and len(ordered) < limit * 5:
+        if organic and promoted:
             ordered.append(promoted.pop(0))
-    # Do not emit an ad more frequently than one per five positions.
-    if len(ordered) < limit * 5:
-        ordered.extend(organic)
+    ordered.extend(promoted)
 
     if cursor is not None:
         cursor_index = next(
@@ -203,7 +180,6 @@ async def get_feed(
             )
         ordered = ordered[cursor_index + 1 :]
 
-    ordered = [row for row in ordered if row[0].id not in excluded]
     page_rows = ordered[:limit]
     items = [
         await build_feed_item(session, reel, listing, seller, user.id, promoted_ids)
