@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import Optional
 from uuid import UUID
+from typing import Literal
 
 class MediaItem(BaseModel):
     url: str
@@ -10,7 +11,7 @@ class MediaItem(BaseModel):
     height: Optional[int] = None
 
 class Media(BaseModel):
-    type: str  # video, photo, album
+    type: Literal["video", "photo", "album"]
     items: list[MediaItem]
 
 class Price(BaseModel):
@@ -24,8 +25,8 @@ class Seller(BaseModel):
     rating: float
 
 class FeedItem(BaseModel):
-    reel_id: str
-    listing_id: str
+    reel_id: UUID
+    listing_id: UUID
     media: Media
     title: str
     price: Optional[Price] = None
@@ -40,12 +41,12 @@ class FeedResponse(BaseModel):
     session_id: str
 
 class SwipeIn(BaseModel):
-    reel_id: str
-    action: str  # like, dislike, skip
-    client_id: str
-    session_id: Optional[str] = None
-    dwell_ms: Optional[int] = None
-    position: int = 0
+    reel_id: UUID
+    action: Literal["like", "dislike", "skip"]
+    client_id: UUID
+    session_id: Optional[str] = Field(default=None, max_length=100)
+    dwell_ms: Optional[int] = Field(default=None, ge=0, le=3_600_000)
+    position: int = Field(default=0, ge=0)
 
 class SwipeOut(BaseModel):
     in_wishlist: bool
@@ -53,12 +54,12 @@ class SwipeOut(BaseModel):
     swipes_total: int
 
 class ListingPage(BaseModel):
-    listing_id: str
+    listing_id: UUID
     title: str
     description: str
     price: Price
     city: str
     seller: Seller
-    status: str  # available, sold
+    status: Literal["available", "sold", "removed"]
     listing_url: str
     images: list[MediaItem]

@@ -1,247 +1,422 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
-from app.db.session import get_db
-from app.schemas.feed import FeedResponse, FeedItem, SwipeIn, SwipeOut, ListingPage, Media, MediaItem, Price, Seller
-from app.db.models import Reel, ReelMedia, Listing, User, Swipe, WishlistItem, Promotion, UserInterest
-from app.core.security import get_current_user
-from app.services.recommender import recommend, score_swipe
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
-from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import delete, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.security import get_current_user
+from app.db.models import (
+    Event,
+    Listing,
+    ListingImage,
+    Promotion,
+    Reel,
+    ReelMedia,
+    Swipe,
+    User,
+    UserInterest,
+    UserOnboarding,
+    WishlistItem,
+)
+from app.db.session import get_db
+from app.schemas.feed import (
+    FeedItem,
+    FeedResponse,
+    ListingPage,
+    Media,
+    MediaItem,
+    Price,
+    Seller,
+    SwipeIn,
+    SwipeOut,
+)
+from app.services.recommender import recommend
 
 router = APIRouter()
 
-@router.get("/feed", response_model=FeedResponse)
-async def get_feed(
-    limit: int = Query(10, ge=1, le=20),
-    cursor: str | None = None,
-    session_id: str | None = None,
-    token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
-    user = await get_current_user(token, session)
-    session_id = session_id or str(uuid4())
 
-    # Действия пользователя, чтобы не показывать лайкнутые/дизлайкнутые
-    swipes_res = await session.execute(
-        select(Swipe.reel_id, Swipe.action, Swipe.created_at)
-        .where(Swipe.user_id == user.id)
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def get_user_from_header(
+    authorization: str | None, session: AsyncSession
+) -> User:
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "unauthorized", "message": "Bearer token required"},
+        )
+    return await get_current_user(authorization, session)
+
+
+async def build_feed_item(
+    session: AsyncSession,
+    reel: Reel,
+    listing: Listing,
+    seller: User,
+    user_id: UUID | None,
+    promoted_ids: set[UUID],
+) -> FeedItem:
+    media_result = await session.scalars(
+        select(ReelMedia)
+        .where(ReelMedia.reel_id == reel.id)
+        .order_by(ReelMedia.position, ReelMedia.id)
     )
-    swipes = swipes_res.all()
-
-    exclude_ids = []
-    now = datetime.utcnow()
-    for reel_id, action, created_at in swipes:
-        if action in ("like", "dislike"):
-            exclude_ids.append(reel_id)
-        elif action == "skip":
-            # Пропущенные скрываем на 24 часа
-            if now - created_at < timedelta(hours=24):
-                exclude_ids.append(reel_id)
-
-    # Кол-во свайпов
-    swipes_count = len([s for s in swipes if s[1] in ("like", "dislike")])
-
-    # Выбираем рилсы
-    if swipes_count < 5:
-        # Холодный старт: по интересам или популярные
-        interests_res = await session.execute(
-            select(UserInterest.category_id).where(UserInterest.user_id == user.id)
+    media_items = [
+        MediaItem(
+            url=item.url,
+            poster=item.poster_url,
+            duration_sec=item.duration_sec,
+            width=item.width,
+            height=item.height,
         )
-        cat_ids = [r[0] for r in interests_res.all()]
-
-        query = select(Reel).join(Listing).where(
-            Reel.status == "published",
-            Reel.enabled == True,
-            Reel.seller_id != user.id,
-            Listing.status == "active"
-        )
-        if cat_ids:
-            query = query.where(Listing.category_id.in_(cat_ids))
-
-        query = query.order_by(Reel.published_at.desc()).limit(limit * 2)
-        res = await session.execute(query)
-        reels = res.scalars().all()
-        reels = [r for r in reels if r.id not in exclude_ids][:limit]
-    else:
-        # После 5 свайпов через рекомендации
-        rec_ids = await recommend(session, str(user.id), limit, exclude_ids)
-        if rec_ids:
-            res = await session.execute(select(Reel).where(Reel.id.in_(rec_ids)))
-            reels = res.scalars().all()
-        else:
-            reels = []
-
-    # Продвигаемые рилсы (максимум 1 на каждые 5 карточек)
-    promotions_res = await session.execute(
-        select(Promotion.reel_id).where(
-            Promotion.status == "active",
-            Promotion.active_until > now
-        )
-    )
-    promoted_reel_ids = set(r[0] for r in promotions_res.all())
-
-    # Формируем результат
-    items = []
-    for reel in reels:
-        # Модель товара и продавца
-        listing = await session.get(Listing, reel.listing_id)
-        seller = await session.get(User, reel.seller_id)
-        media_res = await session.execute(
-            select(ReelMedia).where(ReelMedia.reel_id == reel.id).order_by(ReelMedia.position)
-        )
-        media_items = media_res.scalars().all()
-
-        # Вишлист?
-        wish_res = await session.execute(
-            select(WishlistItem).where(
-                WishlistItem.user_id == user.id,
-                WishlistItem.listing_id == listing.id
-            )
-        )
-        in_wishlist = wish_res.scalar_one_or_none() is not None
-
-        items.append(FeedItem(
-            reel_id=str(reel.id),
-            listing_id=str(listing.id),
-            media=Media(
-                type=reel.media_type,
-                items=[
-                    MediaItem(
-                        url=m.url,
-                        poster=m.poster_url,
-                        duration_sec=m.duration_sec,
-                        width=m.width,
-                        height=m.height
-                    ) for m in media_items
-                ]
-            ),
-            title=listing.title,
-            price=Price(amount=listing.price_amount, currency=listing.currency) if reel.show_price else None,
-            description=reel.description or listing.description or "",
-            seller=Seller(
-                id=str(seller.id),
-                name=seller.name or "Продавец",
-                avatar_url=seller.avatar_url,
-                rating=4.8
-            ),
-            is_promoted=reel.id in promoted_reel_ids,
-            in_wishlist=in_wishlist
-        ))
-
-    next_cursor = str(items[-1].reel_id) if len(items) == limit else None
-
-    return FeedResponse(
-        items=items,
-        next_cursor=next_cursor,
-        session_id=session_id
-    )
-
-@router.post("/swipes", response_model=SwipeOut)
-async def create_swipe(
-    data: SwipeIn,
-    token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
-    user = await get_current_user(token, session)
-
-    # Идемпотентность по client_id
-    existing = await session.execute(
-        select(Swipe).where(Swipe.client_id == UUID(data.client_id))
-    )
-    if existing.scalar_one_or_none():
-        # Повтор — вернём текущий статус
-        wish_count = await session.execute(
-            select(func.count(WishlistItem.id)).where(WishlistItem.user_id == user.id)
-        )
-        swipes_count = await session.execute(
-            select(func.count(Swipe.id)).where(Swipe.user_id == user.id)
-        )
-        return SwipeOut(
-            in_wishlist=False,
-            wishlist_count=wish_count.scalar_one(),
-            swipes_total=swipes_count.scalar_one()
-        )
-
-    reel = await session.get(Reel, UUID(data.reel_id))
-    if not reel:
-        raise HTTPException(status_code=404, detail="Reel not found")
-
-    listing = await session.get(Listing, reel.listing_id)
-    if listing.status != "active" and data.action == "like":
-        raise HTTPException(status_code=409, detail="Listing unavailable")
-
-    # Сохраняем свайп
-    swipe = Swipe(
-        id=uuid4(),
-        user_id=user.id,
-        reel_id=reel.id,
-        action=data.action,
-        client_id=UUID(data.client_id),
-        session_id=data.session_id,
-        dwell_ms=data.dwell_ms,
-        position=data.position
-    )
-    session.add(swipe)
-
+        for item in media_result.all()
+    ]
     in_wishlist = False
-    if data.action == "like":
-        # Добавляем в вишлист
-        wish_existing = await session.execute(
-            select(WishlistItem).where(
-                WishlistItem.user_id == user.id,
-                WishlistItem.listing_id == listing.id
+    if user_id:
+        in_wishlist = bool(
+            await session.scalar(
+                select(WishlistItem.id)
+                .where(
+                    WishlistItem.user_id == user_id,
+                    WishlistItem.listing_id == listing.id,
+                )
+                .limit(1)
             )
         )
-        if not wish_existing.scalar_one_or_none():
-            wish_item = WishlistItem(
-                id=uuid4(),
-                user_id=user.id,
-                listing_id=listing.id,
-                reel_id=reel.id
-            )
-            session.add(wish_item)
-            in_wishlist = True
-
-    await session.commit()
-
-    # Считаем количество
-    wish_count = await session.execute(
-        select(func.count(WishlistItem.id)).where(WishlistItem.user_id == user.id)
-    )
-    swipes_count = await session.execute(
-        select(func.count(Swipe.id)).where(Swipe.user_id == user.id)
-    )
-
-    return SwipeOut(
-        in_wishlist=in_wishlist,
-        wishlist_count=wish_count.scalar_one(),
-        swipes_total=swipes_count.scalar_one()
-    )
-
-@router.get("/listings/{listing_id}", response_model=ListingPage)
-async def get_listing(listing_id: str, session: AsyncSession = Depends(get_db)):
-    listing = await session.get(Listing, UUID(listing_id))
-    if not listing:
-        raise HTTPException(status_code=404, detail="Listing not found")
-
-    seller = await session.get(User, listing.seller_id)
-
-    return ListingPage(
-        listing_id=str(listing.id),
+    return FeedItem(
+        reel_id=reel.id,
+        listing_id=listing.id,
+        media=Media(type=reel.media_type, items=media_items),
         title=listing.title,
-        description=listing.description or "",
-        price=Price(amount=listing.price_amount, currency=listing.currency),
-        city=listing.city or "Москва",
+        price=Price(amount=listing.price_amount, currency=listing.currency)
+        if reel.show_price
+        else None,
+        description=reel.description or listing.description or "",
         seller=Seller(
             id=str(seller.id),
             name=seller.name or "Продавец",
             avatar_url=seller.avatar_url,
-            rating=4.8
+            rating=4.8,
         ),
-        status="available" if listing.status == "active" else "sold",
-        listing_url=listing.listing_url or f"https://avito.ru/item/{listing.id}",
-        images=[MediaItem(url=f"https://cdn.example.com/listings/{listing.id}/1.jpg")]
+        is_promoted=reel.id in promoted_ids,
+        in_wishlist=in_wishlist,
+    )
+
+
+@router.get("/feed", response_model=FeedResponse)
+async def get_feed(
+    limit: int = Query(10, ge=1, le=20),
+    cursor: UUID | None = None,
+    session_id: str | None = Query(default=None, max_length=100),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> FeedResponse:
+    user = await get_user_from_header(authorization, session)
+    now = utc_now()
+
+    swipe_rows = await session.execute(
+        select(Swipe.reel_id, Swipe.action, Swipe.created_at, Swipe.id)
+        .where(Swipe.user_id == user.id, Swipe.undone_at.is_(None))
+        .order_by(Swipe.created_at, Swipe.id)
+    )
+    latest_action: dict[UUID, tuple[str, datetime]] = {}
+    swipe_count = 0
+    for reel_id, action, created_at, _ in swipe_rows.all():
+        latest_action[reel_id] = (action, created_at)
+        swipe_count += 1
+    excluded = {
+        reel_id
+        for reel_id, (action, created_at) in latest_action.items()
+        if action in {"like", "dislike"}
+        or (action == "skip" and created_at > now - timedelta(hours=24))
+    }
+
+    interests_result = await session.execute(
+        select(UserInterest.category_id).where(UserInterest.user_id == user.id)
+    )
+    category_ids = [row[0] for row in interests_result.all()]
+    onboarding = await session.get(UserOnboarding, user.id)
+
+    candidate_query = (
+        select(Reel, Listing, User)
+        .join(Listing, Listing.id == Reel.listing_id)
+        .join(User, User.id == Reel.seller_id)
+        .where(
+            Reel.status == "published",
+            Reel.enabled.is_(True),
+            Reel.seller_id != user.id,
+            Listing.status == "active",
+        )
+    )
+    if swipe_count < 5 and category_ids and not (
+        onboarding and onboarding.interests_skipped
+    ):
+        candidate_query = candidate_query.where(Listing.category_id.in_(category_ids))
+
+    candidate_result = await session.execute(
+        candidate_query.order_by(
+            Reel.published_at.desc().nullslast(), Reel.id.desc()
+        )
+    )
+    candidates = candidate_result.all()
+    if swipe_count >= 5:
+        ranked_ids = await recommend(
+            session, user.id, limit=max(len(candidates), limit)
+        )
+        rank = {reel_id: index for index, reel_id in enumerate(ranked_ids)}
+        candidates.sort(key=lambda row: rank.get(row[0].id, len(rank)))
+
+    promotion_rows = await session.scalars(
+        select(Promotion.reel_id)
+        .where(
+            Promotion.status == "active",
+            Promotion.starts_at <= now,
+            Promotion.active_until > now,
+        )
+    )
+    promoted_ids = set(promotion_rows.all())
+
+    organic = [row for row in candidates if row[0].id not in promoted_ids]
+    promoted = [row for row in candidates if row[0].id in promoted_ids]
+    ordered = []
+    while organic and len(ordered) < limit * 5:
+        ordered.extend(organic[:4])
+        del organic[:4]
+        if promoted and len(ordered) < limit * 5:
+            ordered.append(promoted.pop(0))
+    # Do not emit an ad more frequently than one per five positions.
+    if len(ordered) < limit * 5:
+        ordered.extend(organic)
+
+    if cursor is not None:
+        cursor_index = next(
+            (index for index, row in enumerate(ordered) if row[0].id == cursor),
+            None,
+        )
+        if cursor_index is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "not_found", "message": "Feed cursor not found"},
+            )
+        ordered = ordered[cursor_index + 1 :]
+
+    ordered = [row for row in ordered if row[0].id not in excluded]
+    page_rows = ordered[:limit]
+    items = [
+        await build_feed_item(session, reel, listing, seller, user.id, promoted_ids)
+        for reel, listing, seller in page_rows
+    ]
+    next_cursor = items[-1].reel_id if len(ordered) > limit and items else None
+    return FeedResponse(
+        items=items,
+        next_cursor=str(next_cursor) if next_cursor else None,
+        session_id=session_id or str(uuid4()),
+    )
+
+
+@router.post("/swipes", response_model=SwipeOut)
+async def create_swipe(
+    data: SwipeIn,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> SwipeOut:
+    user = await get_user_from_header(authorization, session)
+    existing = await session.scalar(
+        select(Swipe).where(Swipe.client_id == data.client_id)
+    )
+    if existing:
+        if existing.user_id != user.id:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "validation_error", "message": "client_id already used"},
+            )
+        wishlist_count = await session.scalar(
+            select(func.count(WishlistItem.id)).where(WishlistItem.user_id == user.id)
+        )
+        swipe_count = await session.scalar(
+            select(func.count(Swipe.id)).where(
+                Swipe.user_id == user.id, Swipe.undone_at.is_(None)
+            )
+        )
+        is_wishlisted = await session.scalar(
+            select(WishlistItem.id)
+            .where(WishlistItem.user_id == user.id)
+            .where(
+                WishlistItem.listing_id
+                == await session.scalar(
+                    select(Reel.listing_id).where(Reel.id == existing.reel_id)
+                )
+            )
+            .limit(1)
+        )
+        return SwipeOut(
+            in_wishlist=bool(is_wishlisted),
+            wishlist_count=wishlist_count or 0,
+            swipes_total=swipe_count or 0,
+        )
+
+    reel = await session.get(Reel, data.reel_id)
+    if not reel:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    listing = await session.get(Listing, reel.listing_id)
+    if data.action == "like" and listing.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "listing_unavailable", "message": "Listing is no longer available"},
+        )
+
+    swipe = Swipe(
+        user_id=user.id,
+        reel_id=reel.id,
+        action=data.action,
+        client_id=data.client_id,
+        session_id=data.session_id,
+        dwell_ms=data.dwell_ms,
+        position=data.position,
+    )
+    session.add(swipe)
+    in_wishlist = False
+    if data.action == "like":
+        existing_item = await session.scalar(
+            select(WishlistItem.id).where(
+                WishlistItem.user_id == user.id,
+                WishlistItem.listing_id == listing.id,
+            )
+        )
+        if not existing_item:
+            session.add(
+                WishlistItem(
+                    user_id=user.id, listing_id=listing.id, reel_id=reel.id
+                )
+            )
+            in_wishlist = True
+        else:
+            in_wishlist = True
+    await session.commit()
+    wishlist_count = await session.scalar(
+        select(func.count(WishlistItem.id)).where(WishlistItem.user_id == user.id)
+    )
+    swipe_count = await session.scalar(
+        select(func.count(Swipe.id)).where(
+            Swipe.user_id == user.id, Swipe.undone_at.is_(None)
+        )
+    )
+    return SwipeOut(
+        in_wishlist=in_wishlist,
+        wishlist_count=wishlist_count or 0,
+        swipes_total=swipe_count or 0,
+    )
+
+
+@router.post("/swipes/undo")
+async def undo_swipe(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> FeedItem:
+    user = await get_user_from_header(authorization, session)
+    last_swipe = await session.scalar(
+        select(Swipe)
+        .where(Swipe.user_id == user.id, Swipe.undone_at.is_(None))
+        .order_by(Swipe.created_at.desc(), Swipe.id.desc())
+        .limit(1)
+    )
+    if last_swipe is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "No swipe to undo"})
+    last_swipe.undone_at = utc_now()
+    reel = await session.get(Reel, last_swipe.reel_id)
+    listing = await session.get(Listing, reel.listing_id)
+    if last_swipe.action == "like":
+        await session.execute(
+            delete(WishlistItem).where(
+                WishlistItem.user_id == user.id,
+                WishlistItem.listing_id == listing.id,
+            )
+        )
+    seller = await session.get(User, reel.seller_id)
+    promotion_ids = set(
+        (await session.scalars(
+            select(Promotion.reel_id).where(
+                Promotion.status == "active",
+                Promotion.active_until > utc_now(),
+            )
+        )).all()
+    )
+    await session.commit()
+    return await build_feed_item(session, reel, listing, seller, user.id, promotion_ids)
+
+
+async def get_feed_reel(
+    reel_id: UUID,
+    user_id: UUID | None,
+    session: AsyncSession,
+) -> FeedItem:
+    row = (
+        await session.execute(
+            select(Reel, Listing, User)
+            .join(Listing, Listing.id == Reel.listing_id)
+            .join(User, User.id == Reel.seller_id)
+            .where(Reel.id == reel_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    reel, listing, seller = row
+    promotions = await session.scalars(
+        select(Promotion.reel_id).where(
+            Promotion.reel_id == reel.id,
+            Promotion.status == "active",
+            Promotion.active_until > utc_now(),
+        )
+    )
+    return await build_feed_item(
+        session, reel, listing, seller, user_id, set(promotions.all())
+    )
+
+
+@router.get("/reels/{reel_id}", response_model=FeedItem)
+async def get_reel(
+    reel_id: UUID,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> FeedItem:
+    user = await get_user_from_header(authorization, session)
+    return await get_feed_reel(reel_id, user.id, session)
+
+
+@router.get("/listings/{listing_id}", response_model=ListingPage)
+async def get_listing(
+    listing_id: UUID,
+    session: AsyncSession = Depends(get_db),
+) -> ListingPage:
+    listing = await session.get(Listing, listing_id)
+    if listing is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Listing not found"})
+    seller = await session.get(User, listing.seller_id)
+    image_rows = await session.scalars(
+        select(ListingImage)
+        .where(ListingImage.listing_id == listing.id)
+        .order_by(ListingImage.position, ListingImage.id)
+    )
+    return ListingPage(
+        listing_id=listing.id,
+        title=listing.title,
+        description=listing.description or "",
+        price=Price(amount=listing.price_amount, currency=listing.currency),
+        city=listing.city or "",
+        seller=Seller(
+            id=str(seller.id),
+            name=seller.name or "Продавец",
+            avatar_url=seller.avatar_url,
+            rating=4.8,
+        ),
+        status={
+            "active": "available",
+            "sold": "sold",
+            "removed": "removed",
+        }[listing.status],
+        listing_url=listing.listing_url or "",
+        images=[MediaItem(url=image.url) for image in image_rows.all()],
     )

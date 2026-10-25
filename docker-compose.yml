@@ -5,10 +5,25 @@ services:
       - "8000:8000"
     env_file: .env
     depends_on:
-      - postgres
-      - redis
-      - minio
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command: arq app.worker.media.WorkerSettings
 
   postgres:
     image: postgres:15
@@ -20,14 +35,24 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d avito_svayp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: redis:7
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   minio:
-    image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
@@ -37,6 +62,21 @@ services:
       MINIO_ROOT_PASSWORD: minioadmin
     volumes:
       - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until mc alias set local http://minio:9000 minioadmin minioadmin;
+        do sleep 2; done;
+        mc mb --ignore-existing local/avito-svayp;
+        mc cors set local/avito-svayp /tmp/minio-cors.json
+    volumes:
+      - ./minio-cors.json:/tmp/minio-cors.json:ro
+
 volumes:
   pg_data:
   minio_data:

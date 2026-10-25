@@ -1,157 +1,211 @@
 import asyncio
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.db.session import engine, async_session
-from app.db.models import (
-    Base, User, Category, UserOnboarding, UserInterest,
-    Listing, ListingImage, Reel, ReelMedia, WishlistItem, WishlistShare,
-    PromotionPlan, Promotion
-)
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
-from datetime import datetime, timedelta
 
-async def seed():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
+from sqlalchemy import select
 
+from app.db.models import (
+    Category,
+    Listing,
+    ListingImage,
+    Promotion,
+    PromotionPlan,
+    Reel,
+    ReelMedia,
+    Swipe,
+    User,
+    UserInterest,
+    UserOnboarding,
+    WishlistItem,
+    WishlistShare,
+)
+from app.db.session import async_session
+
+CATEGORY_DATA = [
+    ("electronics", "Электроника", "#FF6B00"),
+    ("fashion", "Одежда", "#0099FF"),
+    ("home", "Дом и квартира", "#00CC66"),
+    ("sports", "Спорт", "#FF3366"),
+    ("books", "Книги", "#9933FF"),
+    ("toys", "Игрушки", "#FF9900"),
+    ("auto", "Авто", "#666666"),
+    ("pets", "Животные", "#FF66CC"),
+    ("beauty", "Красота", "#FF0066"),
+    ("tools", "Инструменты", "#009999"),
+]
+
+
+async def seed() -> None:
     async with async_session() as session:
-        # Пользователи
-        buyer = User(id=uuid4(), name="Покупатель", is_guest=False, demo_role="buyer")
-        friend = User(id=uuid4(), name="Друг", is_guest=False, demo_role="friend")
-        seller = User(id=uuid4(), name="Продавец", is_guest=False, demo_role="seller")
+        existing = await session.scalar(
+            select(User.id).where(User.demo_role == "buyer").limit(1)
+        )
+        if existing:
+            print("Seed data already exists; no changes made.")
+            return
+
+        now = datetime.now(timezone.utc)
+        buyer = User(name="Покупатель", city="Москва", is_guest=False, demo_role="buyer")
+        friend = User(name="Друг", city="Москва", is_guest=False, demo_role="friend")
+        seller = User(name="Продавец", city="Москва", is_guest=False, demo_role="seller")
         session.add_all([buyer, friend, seller])
         await session.flush()
 
-        # Категории
-        categories = []
-        for i, (slug, name, color) in enumerate([
-            ("electronics", "Электроника", "#FF6B00"),
-            ("fashion", "Одежда", "#0099FF"),
-            ("home", "Дом и квартира", "#00CC66"),
-            ("sports", "Спорт", "#FF3366"),
-            ("books", "Книги", "#9933FF"),
-            ("toys", "Игрушки", "#FF9900"),
-            ("auto", "Авто", "#666666"),
-            ("pets", "Животные", "#FF66CC"),
-            ("beauty", "Красота", "#FF0066"),
-            ("tools", "Инструменты", "#009999"),
-        ]):
-            categories.append(Category(id=uuid4(), slug=slug, name=name, color=color, sort=i))
+        categories = [
+            Category(
+                slug=slug,
+                name=name,
+                color=color,
+                image_url=f"https://cdn.example.com/categories/{slug}.jpg",
+                sort=sort,
+            )
+            for sort, (slug, name, color) in enumerate(CATEGORY_DATA)
+        ]
         session.add_all(categories)
         await session.flush()
 
-        # Онбординг для покупателя
-        onboarding = UserOnboarding(user_id=buyer.id, interests_done=True, hint_seen=True)
-        session.add(onboarding)
+        session.add(
+            UserOnboarding(
+                user_id=buyer.id,
+                interests_done=True,
+                interests_skipped=False,
+                hint_seen=True,
+            )
+        )
+        session.add_all(
+            UserInterest(user_id=buyer.id, category_id=category.id)
+            for category in categories[:3]
+        )
 
-        # Интересы покупателя
-        session.add(UserInterest(user_id=buyer.id, category_id=categories[0].id))
-        session.add(UserInterest(user_id=buyer.id, category_id=categories[1].id))
-        session.add(UserInterest(user_id=buyer.id, category_id=categories[2].id))
-
-        # Товары
-        listings = []
-        for i in range(30):
-            cat = categories[i % len(categories)]
-            listing = Listing(
-                id=uuid4(),
+        listings = [
+            Listing(
                 seller_id=seller.id,
-                category_id=cat.id,
-                title=f"Товар {i+1}",
-                description=f"Описание товара {i+1}",
-                price_amount=1000 + i * 500,
+                category_id=categories[index % len(categories)].id,
+                title=f"Товар {index + 1}",
+                description=f"Описание товара {index + 1}",
+                price_amount=1000 + index * 500,
                 currency="RUB",
                 city="Москва",
-                status="active",
-                listing_url=f"https://avito.ru/item/{i+1}"
+                status="sold" if index == 5 else "active",
+                listing_url=f"https://avito.ru/item/{index + 1}",
             )
-            listings.append(listing)
+            for index in range(30)
+        ]
         session.add_all(listings)
         await session.flush()
+        session.add_all(
+            ListingImage(
+                listing_id=listing.id,
+                url=f"https://cdn.example.com/listings/{index + 1}/1.jpg",
+                position=0,
+            )
+            for index, listing in enumerate(listings)
+        )
 
-        # Рилсы
-        reels = []
-        for i, listing in enumerate(listings[:20]):
+        reels: list[Reel] = []
+        reel_media: list[ReelMedia] = []
+        for index, listing in enumerate(listings):
+            is_video = index % 2 == 0
             reel = Reel(
-                id=uuid4(),
                 listing_id=listing.id,
                 seller_id=seller.id,
                 status="published",
-                media_type="video" if i % 2 == 0 else "photo",
-                show_price=True,
-                description=f"Рилс для товара {i+1}",
-                cover_url=f"https://cdn.example.com/reels/{i+1}/cover.jpg",
+                media_type="video" if is_video else ("album" if index % 3 == 1 else "photo"),
+                show_price=index % 7 != 0,
+                description=f"Рилс для товара {index + 1}",
+                cover_url=f"https://cdn.example.com/reels/{index + 1}/cover.jpg",
                 enabled=True,
-                published_at=datetime.utcnow() - timedelta(days=i % 5)
+                published_at=now - timedelta(days=index % 5),
             )
             reels.append(reel)
         session.add_all(reels)
         await session.flush()
 
-        # Медиа для рилсов
-        media = []
-        for i, reel in enumerate(reels):
+        for index, reel in enumerate(reels):
             if reel.media_type == "video":
-                media.append(ReelMedia(
-                    id=uuid4(), reel_id=reel.id, kind="video",
-                    url=f"https://cdn.example.com/reels/{i+1}/video.mp4",
-                    poster_url=f"https://cdn.example.com/reels/{i+1}/poster.jpg",
-                    duration_sec=24, width=1080, height=1920, position=0
-                ))
+                reel_media.append(
+                    ReelMedia(
+                        reel_id=reel.id,
+                        kind="video",
+                        url=f"https://cdn.example.com/videos/{index + 1}/video.mp4",
+                        poster_url=f"https://cdn.example.com/videos/{index + 1}/poster.jpg",
+                        duration_sec=24,
+                        width=1080,
+                        height=1920,
+                        position=0,
+                    )
+                )
             else:
-                for j in range(3):
-                    media.append(ReelMedia(
-                        id=uuid4(), reel_id=reel.id, kind="photo",
-                        url=f"https://cdn.example.com/reels/{i+1}/photo_{j}.jpg",
-                        width=1080, height=1920, position=j
-                    ))
-        session.add_all(media)
-        await session.flush()
-
-        # Вишлист покупателя (8 товаров)
-        wishlist_items = []
-        for i in range(8):
-            wishlist_items.append(WishlistItem(
-                id=uuid4(),
+                photo_count = 3 if reel.media_type == "album" else 1
+                reel_media.extend(
+                    ReelMedia(
+                        reel_id=reel.id,
+                        kind="photo",
+                        url=f"https://cdn.example.com/photos/{index + 1}/{photo + 1}.jpg",
+                        width=1080,
+                        height=1920,
+                        position=photo,
+                    )
+                    for photo in range(photo_count)
+                )
+        session.add_all(reel_media)
+        session.add_all(
+            WishlistItem(
                 user_id=buyer.id,
-                listing_id=listings[i].id,
-                reel_id=reels[i].id,
-                added_at=datetime.utcnow() - timedelta(days=7-i)
-            ))
-        session.add_all(wishlist_items)
-
-        # Один товар продан
-        listings[5].status = "sold"
-
-        # Продвижение одного рилса
-        plan = PromotionPlan(
-            id=uuid4(), days=7, estimated_reach=5000,
-            price_amount=500, is_best_value=True
+                listing_id=listings[index].id,
+                reel_id=reels[index].id,
+                added_at=now - timedelta(days=7 - index),
+            )
+            for index in range(8)
         )
-        session.add(plan)
+        session.add_all(
+            Swipe(
+                user_id=buyer.id,
+                reel_id=reels[index].id,
+                action="skip" if index % 2 else "dislike",
+                client_id=uuid4(),
+                session_id="seed-session",
+                dwell_ms=1200,
+                position=index,
+            )
+            for index in range(8, 12)
+        )
+
+        plans = [
+            PromotionPlan(
+                days=days,
+                estimated_reach=reach,
+                price_amount=price,
+                is_best_value=best,
+            )
+            for days, reach, price, best in (
+                (3, 1800, 199, False),
+                (7, 5000, 399, True),
+                (14, 9500, 699, False),
+            )
+        ]
+        session.add_all(plans)
         await session.flush()
-
-        promotion = Promotion(
-            id=uuid4(),
-            reel_id=reels[0].id,
-            plan_id=plan.id,
-            status="active",
-            starts_at=datetime.utcnow() - timedelta(days=1),
-            active_until=datetime.utcnow() + timedelta(days=6)
+        session.add(
+            Promotion(
+                reel_id=reels[0].id,
+                plan_id=plans[1].id,
+                status="active",
+                starts_at=now - timedelta(days=1),
+                active_until=now + timedelta(days=6),
+            )
         )
-        session.add(promotion)
-
-        # Доступ к вишлисту по ссылке
-        share = WishlistShare(
-            user_id=buyer.id,
-            token="k7x2p9",
-            enabled=True,
-            rotated_at=datetime.utcnow()
+        session.add(
+            WishlistShare(
+                user_id=buyer.id,
+                token="k7x2p9",
+                enabled=True,
+                rotated_at=now,
+            )
         )
-        session.add(share)
-
         await session.commit()
-        print("Seed completed successfully!")
+    print("Seed data created.")
+
 
 if __name__ == "__main__":
     asyncio.run(seed())

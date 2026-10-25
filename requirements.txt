@@ -6,7 +6,10 @@ alembic
 pydantic-settings
 aioboto3
 python-jose[cryptography]
-passlib[bcrypt]
 redis
-aioredis
 greenlet>=3.1.0
+arq
+pytest
+pytest-asyncio
+httpx
+aiosqlite

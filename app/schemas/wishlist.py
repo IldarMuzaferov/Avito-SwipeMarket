@@ -28,7 +28,7 @@ class WishlistResponse(BaseModel):
     next_cursor: Optional[str] = None
 
 class AddWishlistItemIn(BaseModel):
-    listing_id: str
+    listing_id: UUID
 
 class ShareToggleIn(BaseModel):
     enabled: bool

@@ -1,148 +1,215 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+
+from app.core.security import get_current_user
+from app.core.config import settings
+from app.db.models import Event, Promotion, PromotionPlan, Reel
 from app.db.session import get_db
 from app.schemas.promotion import (
-    PromotionPlanOut, PromotionCreateIn, PromotionOut,
-    PromotionListOut, EventsBatchIn
+    EventsBatchIn,
+    PromotionCreateIn,
+    PromotionListOut,
+    PromotionOut,
+    PromotionPlanOut,
+    PaymentWebhookIn,
 )
-from app.db.models import PromotionPlan, Promotion, Reel, User, Event
-from app.core.security import get_current_user
-from uuid import UUID, uuid4
-from datetime import datetime, timedelta
 
 router = APIRouter()
 
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 @router.get("/promotion/plans", response_model=list[PromotionPlanOut])
-async def get_promotion_plans(session: AsyncSession = Depends(get_db)):
-    res = await session.execute(select(PromotionPlan))
-    plans = res.scalars().all()
+async def get_promotion_plans(
+    session: AsyncSession = Depends(get_db),
+) -> list[PromotionPlanOut]:
+    plans = await session.scalars(
+        select(PromotionPlan).order_by(PromotionPlan.days, PromotionPlan.id)
+    )
     return [
         PromotionPlanOut(
-            id=str(p.id),
-            days=p.days,
-            estimated_reach=p.estimated_reach,
-            price_amount=p.price_amount,
-            is_best_value=p.is_best_value
-        ) for p in plans
+            id=str(plan.id),
+            days=plan.days,
+            estimated_reach=plan.estimated_reach,
+            price_amount=plan.price_amount,
+            is_best_value=plan.is_best_value,
+        )
+        for plan in plans.all()
     ]
+
 
 @router.post("/reels/{reel_id}/promotions", response_model=PromotionOut)
 async def create_promotion(
-    reel_id: str,
+    reel_id: UUID,
     data: PromotionCreateIn,
     token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
+    session: AsyncSession = Depends(get_db),
+) -> PromotionOut:
     user = await get_current_user(token, session)
+    reel = await session.get(Reel, reel_id)
+    if reel is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    if reel.seller_id != user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your reel"})
+    if reel.status != "published" or not reel.enabled:
+        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Only published reels can be promoted"})
 
-    reel = await session.get(Reel, UUID(reel_id))
-    if not reel or reel.seller_id != user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    plan = await session.get(PromotionPlan, UUID(data.plan_id))
-    if not plan:
-        raise HTTPException(status_code=404, detail="Plan not found")
-
+    plan = await session.get(PromotionPlan, data.plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Promotion plan not found"})
     promotion = Promotion(
         id=uuid4(),
         reel_id=reel.id,
         plan_id=plan.id,
         status="pending_payment",
-        payment_id=f"pay_{uuid4().hex[:8]}",
-        starts_at=None,
-        active_until=None
+        payment_id=f"pay_{uuid4().hex}",
     )
     session.add(promotion)
     await session.commit()
-
     return PromotionOut(
         promotion_id=str(promotion.id),
         status=promotion.status,
-        payment_url=f"https://pay.example.com/{promotion.payment_id}",
-        active_until=None
+        payment_url=f"{settings.MOCK_PAYMENT_BASE_URL.rstrip('/')}/{promotion.payment_id}",
+        active_until=None,
     )
+
 
 @router.post("/promotions/{promotion_id}/mock-pay", response_model=PromotionOut)
 async def mock_pay_promotion(
-    promotion_id: str,
+    promotion_id: UUID,
     token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
+    session: AsyncSession = Depends(get_db),
+) -> PromotionOut:
     user = await get_current_user(token, session)
-
-    promotion = await session.get(Promotion, UUID(promotion_id))
-    if not promotion:
-        raise HTTPException(status_code=404, detail="Promotion not found")
-
+    promotion = await session.get(Promotion, promotion_id)
+    if promotion is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Promotion not found"})
     reel = await session.get(Reel, promotion.reel_id)
-    if not reel or reel.seller_id != user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
+    if reel is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    if reel.seller_id != user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your promotion"})
+    now = now_utc()
+    if promotion.status == "active" and promotion.active_until and promotion.active_until > now:
+        return PromotionOut(
+            promotion_id=str(promotion.id),
+            status=promotion.status,
+            active_until=promotion.active_until,
+        )
+    if promotion.status != "pending_payment":
+        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Promotion cannot be paid in its current state"})
     plan = await session.get(PromotionPlan, promotion.plan_id)
-    now = datetime.utcnow()
+    if plan is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Promotion plan not found"})
     promotion.status = "active"
     promotion.starts_at = now
     promotion.active_until = now + timedelta(days=plan.days)
-
     await session.commit()
-
     return PromotionOut(
         promotion_id=str(promotion.id),
         status=promotion.status,
-        payment_url=None,
-        active_until=promotion.active_until
+        active_until=promotion.active_until,
     )
+
 
 @router.get("/reels/{reel_id}/promotions", response_model=list[PromotionListOut])
 async def get_reel_promotions(
-    reel_id: str,
+    reel_id: UUID,
     token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
+    session: AsyncSession = Depends(get_db),
+) -> list[PromotionListOut]:
     user = await get_current_user(token, session)
-
-    reel = await session.get(Reel, UUID(reel_id))
-    if not reel or reel.seller_id != user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    res = await session.execute(
-        select(Promotion).where(Promotion.reel_id == reel.id)
+    reel = await session.get(Reel, reel_id)
+    if reel is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    if reel.seller_id != user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your reel"})
+    promotions = await session.scalars(
+        select(Promotion)
+        .where(Promotion.reel_id == reel.id)
+        .order_by(Promotion.starts_at.desc().nullslast(), Promotion.id.desc())
     )
-    promotions = res.scalars().all()
-
     return [
         PromotionListOut(
-            promotion_id=str(p.id),
-            plan_id=str(p.plan_id),
-            status=p.status,
-            starts_at=p.starts_at,
-            active_until=p.active_until
-        ) for p in promotions
+            promotion_id=str(item.id),
+            plan_id=str(item.plan_id),
+            status=item.status,
+            starts_at=item.starts_at,
+            active_until=item.active_until,
+        )
+        for item in promotions.all()
     ]
+
 
 @router.post("/events", status_code=202)
 async def post_events(
     data: EventsBatchIn,
     token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
     user = await get_current_user(token, session)
-
-    events = []
-    for e in data.events:
-        events.append(Event(
+    reel_ids = {event.reel_id for event in data.events}
+    found_ids = set(
+        (await session.scalars(select(Reel.id).where(Reel.id.in_(reel_ids)))).all()
+    )
+    if found_ids != reel_ids:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "One or more reels were not found"})
+    session.add_all(
+        Event(
             id=uuid4(),
             user_id=user.id,
-            reel_id=UUID(e.reel_id),
-            type=e.type,
-            value_ms=e.value_ms,
-            ts=datetime.fromisoformat(e.ts) if e.ts else datetime.utcnow()
-        ))
-    session.add_all(events)
+            reel_id=event.reel_id,
+            type=event.type,
+            value_ms=event.value_ms,
+            ts=event.ts or now_utc(),
+        )
+        for event in data.events
+    )
     await session.commit()
     return {"status": "accepted"}
+
+
+@router.post("/payments/webhook")
+async def payment_webhook(
+    data: PaymentWebhookIn,
+    x_payment_signature: str | None = Header(default=None, alias="X-Payment-Signature"),
+    session: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    if not x_payment_signature:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Payment signature required"})
+    signed_payload = f"{data.payment_id}:{data.status}".encode()
+    expected = hmac.new(
+        settings.PAYMENT_WEBHOOK_SECRET.encode(),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(x_payment_signature, expected):
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Invalid payment signature"})
+
+    promotion = await session.scalar(
+        select(Promotion).where(Promotion.payment_id == data.payment_id)
+    )
+    if promotion is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Promotion payment not found"})
+    if promotion.status != "pending_payment":
+        return {"status": promotion.status}
+    if data.status == "failed":
+        promotion.status = "canceled"
+    else:
+        plan = await session.get(PromotionPlan, promotion.plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Promotion plan not found"})
+        now = now_utc()
+        promotion.status = "active"
+        promotion.starts_at = now
+        promotion.active_until = now + timedelta(days=plan.days)
+    await session.commit()
+    return {"status": promotion.status}

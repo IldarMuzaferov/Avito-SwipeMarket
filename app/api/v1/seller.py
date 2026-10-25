@@ -1,17 +1,21 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
+from arq import create_pool
+from arq.connections import RedisSettings
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, delete, update
+from sqlalchemy import delete, func, select, update
 from app.db.session import get_db
 from app.schemas.seller import (
     UploadStartIn, UploadStartOut, UploadFileOut, UploadStatusOut,
-    CropIn, OrderIn, ReelCreateIn, ReelOut, ReelListResponse, ReelListOut, ListingOut
+    CropIn, OrderIn, ReelCreateIn, ReelOut, ReelListResponse, ReelListOut, ListingOut,
+    ReelPatchIn,
 )
-from app.db.models import MediaUpload, MediaFile, Reel, ReelMedia, Listing, User, Promotion
+from app.db.models import Event, MediaUpload, MediaFile, Reel, ReelMedia, Listing, User, Promotion, Swipe, WishlistItem
 from app.core.security import get_current_user
 from app.services.s3_service import s3_service, get_s3_key
 from app.core.config import settings
 from uuid import UUID, uuid4
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import List, Optional
 
 router = APIRouter()
 
@@ -29,17 +33,17 @@ async def start_upload(
         if len(data.files) != 1:
             raise HTTPException(status_code=422, detail={"error": {"code": "bad_format", "message": "Expected 1 video file"}})
         f = data.files[0]
-        if f.size_bytes > 200 * 1024 * 1024:  # 200MB
+        if f.size_bytes > 200 * 1024 * 1024:
             raise HTTPException(status_code=413, detail={"error": {"code": "too_large", "message": "Video exceeds 200MB"}})
-        if not f.content_type.startswith("video/"):
+        if f.content_type not in {"video/mp4", "video/quicktime", "video/webm"}:
             raise HTTPException(status_code=415, detail={"error": {"code": "bad_format", "message": "Not a video"}})
     elif data.kind == "photos":
         if len(data.files) > 10:
             raise HTTPException(status_code=422, detail={"error": {"code": "too_many_files", "message": "Max 10 photos"}})
         for f in data.files:
-            if f.size_bytes > 10 * 1024 * 1024:  # 10MB
+            if f.size_bytes > 10 * 1024 * 1024:
                 raise HTTPException(status_code=413, detail={"error": {"code": "too_large", "message": "Photo exceeds 10MB"}})
-            if not f.content_type.startswith("image/"):
+            if f.content_type not in {"image/jpeg", "image/png", "image/webp"}:
                 raise HTTPException(status_code=415, detail={"error": {"code": "bad_format", "message": "Not an image"}})
     else:
         raise HTTPException(status_code=422, detail="Invalid kind")
@@ -71,7 +75,9 @@ async def start_upload(
         session.add(mf)
 
         # Presigned URL
-        put_url = await s3_service.generate_presigned_url(storage_key)
+        put_url = await s3_service.generate_presigned_url(
+            storage_key, f.content_type
+        )
         res_files.append(UploadFileOut(
             file_id=str(file_id),
             put_url=put_url,
@@ -87,35 +93,56 @@ async def start_upload(
 
 @router.post("/media/uploads/{upload_id}/complete", status_code=202)
 async def complete_upload(
-    upload_id: str,
+    upload_id: UUID,
     token: str = Header(..., alias="Authorization"),
     session: AsyncSession = Depends(get_db)
 ):
     token = token.replace("Bearer ", "")
     user = await get_current_user(token, session)
 
-    upload = await session.get(MediaUpload, UUID(upload_id))
+    upload = await session.get(MediaUpload, upload_id)
     if not upload or upload.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Upload not found")
-
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Upload not found"})
+    if upload.status not in {"created", "uploaded"}:
+        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Upload cannot be completed in its current state"})
+    files_result = await session.scalars(
+        select(MediaFile)
+        .where(MediaFile.upload_id == upload.id)
+        .order_by(MediaFile.position)
+    )
+    files = list(files_result.all())
+    if not files:
+        raise HTTPException(status_code=422, detail={"code": "validation_error", "message": "Upload has no files"})
+    for media_file in files:
+        metadata = await s3_service.head_object(media_file.storage_key)
+        actual_size = metadata.get("ContentLength", 0)
+        if actual_size != media_file.size_bytes:
+            raise HTTPException(status_code=413, detail={"code": "too_large", "message": "Uploaded file exceeds declared size"})
+        if metadata.get("ContentType") != media_file.content_type:
+            raise HTTPException(status_code=415, detail={"code": "bad_format", "message": "Uploaded content type does not match declaration"})
+        media_file.status = "uploaded"
     upload.status = "uploaded"
-    # Имитируем быстрый старт обработки
-    upload.status = "ready"
     await session.commit()
+
+    queue = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+    try:
+        await queue.enqueue_job("process_media_upload", str(upload.id))
+    finally:
+        await queue.aclose()
     return {"status": "processing"}
 
 @router.get("/media/uploads/{upload_id}", response_model=UploadStatusOut)
 async def get_upload_status(
-    upload_id: str,
+    upload_id: UUID,
     token: str = Header(..., alias="Authorization"),
     session: AsyncSession = Depends(get_db)
 ):
     token = token.replace("Bearer ", "")
     user = await get_current_user(token, session)
 
-    upload = await session.get(MediaUpload, UUID(upload_id))
+    upload = await session.get(MediaUpload, upload_id)
     if not upload or upload.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Upload not found")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Upload not found"})
 
     files_res = await session.execute(
         select(MediaFile).where(MediaFile.upload_id == upload.id).order_by(MediaFile.position)
@@ -124,29 +151,92 @@ async def get_upload_status(
 
     file_list = []
     for f in files:
-        url = await s3_service.get_file_url(f.storage_key)
+        url = s3_service.get_file_url(f.storage_key)
+        if f.poster_storage_key:
+            url = s3_service.get_file_url(f.poster_storage_key)
         file_list.append({
             "file_id": str(f.id),
             "preview_url": url,
-            "filename": f.filename
+            "filename": f.filename,
+            "duration_sec": f.duration_sec,
+            "status": f.status,
         })
 
     return UploadStatusOut(
         status=upload.status,
         error=upload.error,
-        duration_sec=15 if upload.kind == "video" else None,
+        duration_sec=max((f.duration_sec or 0 for f in files), default=0) or None,
         files=file_list
     )
 
 @router.post("/media/uploads/{upload_id}/crop")
 async def crop_media(
-    upload_id: str,
+    upload_id: UUID,
     data: CropIn,
     token: str = Header(..., alias="Authorization"),
     session: AsyncSession = Depends(get_db)
 ):
-    # Для демо возвращаем статус успеха
-    return {"status": "ok", "message": "Crop applied"}
+    token = token.removeprefix("Bearer ").strip()
+    user = await get_current_user(token, session)
+    upload = await session.get(MediaUpload, upload_id)
+    if upload is None or upload.user_id != user.id:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Upload not found"})
+    if upload.status not in {"created", "uploaded"}:
+        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Crop must be set before processing"})
+    files = await session.scalars(
+        select(MediaFile).where(MediaFile.upload_id == upload.id)
+    )
+    for media_file in files.all():
+        media_file.crop_x = data.x
+        media_file.crop_y = data.y
+        media_file.crop_width = data.width
+        media_file.crop_height = data.height
+    await session.commit()
+    return {"status": "ok"}
+
+
+@router.put("/media/uploads/{upload_id}/order", status_code=204)
+async def order_upload_files(
+    upload_id: UUID,
+    data: OrderIn,
+    token: str = Header(..., alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    user = await get_current_user(token, session)
+    upload = await session.get(MediaUpload, upload_id)
+    if upload is None or upload.user_id != user.id:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Upload not found"})
+    files_result = await session.scalars(
+        select(MediaFile).where(MediaFile.upload_id == upload.id)
+    )
+    files = list(files_result.all())
+    if len(set(data.file_ids)) != len(data.file_ids) or set(data.file_ids) != {item.id for item in files}:
+        raise HTTPException(status_code=422, detail={"code": "validation_error", "message": "file_ids must contain every upload file exactly once"})
+    by_id = {item.id: item for item in files}
+    for position, file_id in enumerate(data.file_ids):
+        by_id[file_id].position = position
+    await session.commit()
+    return Response(status_code=204)
+
+
+@router.delete("/media/uploads/{upload_id}/files/{file_id}", status_code=204)
+async def delete_upload_file(
+    upload_id: UUID,
+    file_id: UUID,
+    token: str = Header(..., alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    user = await get_current_user(token, session)
+    upload = await session.get(MediaUpload, upload_id)
+    media_file = await session.get(MediaFile, file_id)
+    if upload is None or upload.user_id != user.id or media_file is None or media_file.upload_id != upload.id:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Upload file not found"})
+    await s3_service.delete_file(media_file.storage_key)
+    if media_file.poster_storage_key:
+        await s3_service.delete_file(media_file.poster_storage_key)
+    await session.delete(media_file)
+    await session.commit()
+    return Response(status_code=204)
 
 @router.get("/me/listings", response_model=List[ListingOut])
 async def get_my_listings(
@@ -182,20 +272,26 @@ async def create_reel(
     token = token.replace("Bearer ", "")
     user = await get_current_user(token, session)
 
-    listing = await session.get(Listing, UUID(data.listing_id))
-    if not listing or listing.seller_id != user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    listing = await session.get(Listing, data.listing_id)
+    if listing is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Listing not found"})
+    if listing.seller_id != user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your listing"})
+    if listing.status != "active":
+        raise HTTPException(status_code=409, detail={"code": "listing_unavailable", "message": "Listing is no longer available"})
 
     # Проверка: один рилс на объявление
     existing = await session.execute(
         select(Reel).where(Reel.listing_id == listing.id)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Reel already exists for this listing")
+        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Reel already exists for this listing"})
 
-    upload = await session.get(MediaUpload, UUID(data.upload_id))
+    upload = await session.get(MediaUpload, data.upload_id)
     if not upload or upload.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Upload not found")
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Upload not found"})
+    if upload.status != "ready":
+        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Media upload is not ready"})
 
     # Получаем файлы загрузки
     files_res = await session.execute(
@@ -203,7 +299,7 @@ async def create_reel(
     )
     files = files_res.scalars().all()
     if not files:
-        raise HTTPException(status_code=400, detail="Upload has no files")
+        raise HTTPException(status_code=422, detail={"code": "validation_error", "message": "Upload has no files"})
 
     # Авто-публикация для демо
     status_str = "published" if settings.AUTO_PUBLISH else "moderation"
@@ -216,23 +312,23 @@ async def create_reel(
         status=status_str,
         media_type=media_type,
         show_price=data.show_price,
-        description=data.description[:300] if data.description else None,
-        cover_url=await s3_service.get_file_url(files[0].storage_key),
+        description=data.description,
+        cover_url=s3_service.get_file_url(files[0].poster_storage_key or files[0].storage_key),
         enabled=True,
-        published_at=datetime.utcnow() if status_str == "published" else None
+        published_at=datetime.now(timezone.utc) if status_str == "published" else None
     )
     session.add(reel)
 
     # Добавляем элементы медиа
     for pos, f in enumerate(files):
-        url = await s3_service.get_file_url(f.storage_key)
+        url = s3_service.get_file_url(f.storage_key)
         rm = ReelMedia(
             id=uuid4(),
             reel_id=reel.id,
             kind="video" if upload.kind == "video" else "photo",
             url=url,
-            poster_url=url if upload.kind == "video" else None,
-            duration_sec=15 if upload.kind == "video" else None,
+            poster_url=s3_service.get_file_url(f.poster_storage_key) if f.poster_storage_key else None,
+            duration_sec=f.duration_sec,
             width=1080,
             height=1920,
             position=pos
@@ -257,7 +353,7 @@ async def create_reel(
 async def get_my_reels(
     status_filter: str | None = Query(None, alias="status"),
     limit: int = Query(20, ge=1, le=50),
-    cursor: str | None = None,
+    cursor: UUID | None = None,
     token: str = Header(..., alias="Authorization"),
     session: AsyncSession = Depends(get_db)
 ):
@@ -272,15 +368,37 @@ async def get_my_reels(
     )
     if status_filter:
         query = query.where(Reel.status == status_filter)
+    if cursor:
+        cursor_reel = await session.scalar(
+            select(Reel).where(Reel.id == cursor, Reel.seller_id == user.id)
+        )
+        if cursor_reel is None:
+            raise HTTPException(status_code=400, detail={"code": "validation_error", "message": "Invalid reel cursor"})
+        query = query.where(
+            (Reel.created_at < cursor_reel.created_at)
+            | ((Reel.created_at == cursor_reel.created_at) & (Reel.id < cursor_reel.id))
+        )
 
-    res = await session.execute(query)
+    res = await session.execute(query.limit(limit + 1))
     rows = res.all()
 
     items = []
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     for reel, listing in rows[:limit]:
-        # Статистика
-        stats = {"views": 120, "likes": 15}
+        views = await session.scalar(
+            select(func.count(Event.id)).where(
+                Event.reel_id == reel.id,
+                Event.type.in_(("view", "watch")),
+            )
+        )
+        likes = await session.scalar(
+            select(func.count(Swipe.id)).where(
+                Swipe.reel_id == reel.id,
+                Swipe.action == "like",
+                Swipe.undone_at.is_(None),
+            )
+        )
+        stats = {"views": views or 0, "likes": likes or 0}
 
         # Продвижение
         prom_res = await session.execute(
@@ -292,7 +410,7 @@ async def get_my_reels(
         )
         prom = prom_res.scalar_one_or_none()
         promotion_info = {
-            "active_until": prom.active_until.isoformat() if prom else None
+            "active_until": prom.active_until if prom else None
         }
 
         items.append(ReelListOut(
@@ -307,49 +425,91 @@ async def get_my_reels(
             promotion=promotion_info
         ))
 
-    next_cursor = str(items[-1].reel_id) if len(items) == limit else None
+    next_cursor = items[-1].reel_id if len(rows) > limit and items else None
 
     return ReelListResponse(
         items=items,
         next_cursor=next_cursor
     )
 
+@router.get("/reels/{reel_id}/preview")
+async def preview_reel(
+    reel_id: UUID,
+    show_price: bool | None = None,
+    description: str | None = Query(default=None, max_length=300),
+    token: str = Header(..., alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+):
+    user = await get_current_user(token, session)
+    reel = await session.get(Reel, reel_id)
+    if reel is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    if reel.seller_id != user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your reel"})
+    from app.api.v1.feed import build_feed_item
+
+    listing = await session.get(Listing, reel.listing_id)
+    seller = await session.get(User, reel.seller_id)
+    card = await build_feed_item(session, reel, listing, seller, user.id, set())
+    if show_price is not None:
+        card.price = (
+            {"amount": listing.price_amount, "currency": listing.currency}
+            if show_price
+            else None
+        )
+    if description is not None:
+        card.description = description
+    return card
+
+
 @router.patch("/reels/{reel_id}", response_model=ReelOut)
 async def update_reel(
-    reel_id: str,
-    show_price: Optional[bool] = None,
-    description: Optional[str] = None,
-    enabled: Optional[bool] = None,
+    reel_id: UUID,
+    data: ReelPatchIn,
     token: str = Header(..., alias="Authorization"),
-    session: AsyncSession = Depends(get_db)
-):
-    token = token.replace("Bearer ", "")
+    session: AsyncSession = Depends(get_db),
+) -> ReelOut:
     user = await get_current_user(token, session)
-
-    reel = await session.get(Reel, UUID(reel_id))
-    if not reel:
-        raise HTTPException(status_code=404, detail="Reel not found")
-
+    reel = await session.get(Reel, reel_id)
+    if reel is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
     if reel.seller_id != user.id:
-        raise HTTPException(status_code=403, detail={"error": {"code": "forbidden", "message": "Not your reel"}})
-
-    if show_price is not None:
-        reel.show_price = show_price
-    if description is not None:
-        reel.description = description[:300]
-    if enabled is not None:
-        reel.enabled = enabled
-
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your reel"})
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(reel, field, value)
     await session.commit()
-
     return ReelOut(
-        reel_id=str(reel.id),
-        listing_id=str(reel.listing_id),
+        reel_id=reel.id,
+        listing_id=reel.listing_id,
         status=reel.status,
         media_type=reel.media_type,
         show_price=reel.show_price,
         description=reel.description,
         cover_url=reel.cover_url,
         enabled=reel.enabled,
-        published_at=reel.published_at
+        published_at=reel.published_at,
     )
+
+
+@router.delete("/reels/{reel_id}", status_code=204)
+async def delete_reel(
+    reel_id: UUID,
+    token: str = Header(..., alias="Authorization"),
+    session: AsyncSession = Depends(get_db),
+) -> Response:
+    user = await get_current_user(token, session)
+    reel = await session.get(Reel, reel_id)
+    if reel is None:
+        raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Reel not found"})
+    if reel.seller_id != user.id:
+        raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your reel"})
+    await session.execute(
+        update(WishlistItem)
+        .where(WishlistItem.reel_id == reel.id)
+        .values(reel_id=None)
+    )
+    await session.execute(delete(Promotion).where(Promotion.reel_id == reel.id))
+    await session.execute(delete(ReelMedia).where(ReelMedia.reel_id == reel.id))
+    await session.delete(reel)
+    await session.commit()
+    return Response(status_code=204)
