@@ -1,63 +1,91 @@
-# Avito Svayp — Бэкенд режима «Свайп»
+# SwipeMarket
 
-## Быстрый старт
+Backend API for a marketplace discovery experience built around short product videos and swipe-based browsing. Sellers can create video or photo reels for listings; buyers can discover products, save favorites, and share wishlists.
+
+The project is a FastAPI service with background media processing and a Docker Compose setup for local development.
+
+## Features
+
+- Guest and demo authentication, user profiles, categories, and onboarding interests.
+- Personalized product feed with swipe actions, undo, and recommendation signals.
+- Seller listings and reels, including direct-to-storage uploads using presigned URLs.
+- Background media processing with FFmpeg: video validation and transcoding, poster generation, and portrait formatting.
+- Wishlists with public sharing links.
+- Promotion plans, mock payments, and payment webhook handling.
+- Internal listing updates and administrative reel moderation.
+
+## Tech stack
+
+- **Python 3.12** and **FastAPI**
+- **PostgreSQL** with SQLAlchemy and Alembic
+- **Redis** and **ARQ** for background jobs
+- **SeaweedFS** for local S3-compatible media storage
+- **FFmpeg** for media processing
+- **Docker Compose** for local development
+
+## Getting started
+
+### Requirements
+
+- Docker Desktop with Docker Compose
+- Git
+
+### Run locally
+
+Clone the repository and enter its directory:
 
 ```bash
-# 1. Скопировать .env
-cp .env.example .env
+git clone https://github.com/IldarMuzaferov/SwipeMarket.git
+cd SwipeMarket
+```
 
-# 2. Запустить PostgreSQL, Redis, SeaweedFS, API и worker
-docker compose up -d
+Create a local environment file, then start the services:
 
-# 3. Применить миграции
+```powershell
+Copy-Item .env.example .env
+docker compose up --build -d
+```
+
+On macOS or Linux, use `cp .env.example .env` instead of `Copy-Item`.
+
+Apply database migrations and optionally load demo data:
+
+```bash
 docker compose exec api alembic upgrade head
-
-# 4. Заполнить тестовыми данными
 docker compose exec api python seed.py
-
-# 5. API и документация доступны на http://localhost:8000
 ```
 
-## Основные команды
+The seed script adds sample users, listings, reels, and categories. It is safe to rerun: if demo data already exists, it makes no changes.
+
+The API is available at [http://localhost:8000](http://localhost:8000).
+
+## API documentation
+
+- Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
+- OpenAPI schema: [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json)
+- Liveness check: [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health)
+- Dependency readiness: [http://localhost:8000/api/v1/ready](http://localhost:8000/api/v1/ready)
+
+All application endpoints use the `/api/v1` prefix. Authenticated endpoints expect a bearer access token in the `Authorization` header. See Swagger UI for request schemas and authentication details.
+
+## Media uploads
+
+The client uploads media directly to the S3-compatible storage using a presigned URL. The API queues completed uploads for the ARQ worker, which processes videos and images in the background.
+
+In the provided Docker Compose setup, the API and worker use the internal storage endpoint (`http://seaweedfs:9000`), while browser clients use the public endpoint (`http://localhost:9000`). The local storage console is available at [http://localhost:8888](http://localhost:8888); the SeaweedFS master UI is at [http://localhost:9333](http://localhost:9333).
+
+## Tests
+
+Run the test suite inside the API container:
 
 ```bash
-# Запуск тестов
-docker compose exec api pytest tests/ -v
-
-# Просмотр API docs
-# http://localhost:8000/docs
+docker compose exec api python -m pytest -q
 ```
 
-## Архитектура
+The tests use an isolated SQLite database and do not require a separate test PostgreSQL instance.
 
-- **FastAPI** — веб-фреймворк
-- **PostgreSQL** — основная БД
-- **Redis** — кэш и сессии
-- **SeaweedFS** — S3-совместимое хранилище для локальной разработки
-- **Alembic** — миграции БД
-- **aioboto3** — работа с S3
-- **ARQ + ffmpeg** — обработка загруженных видео и фото в фоне
+## Configuration and security
 
-## Проверки
+Use `.env.example` as the starting point for local configuration. The `.env` file is ignored by Git and must not be committed. Replace development keys and credentials before deploying anywhere beyond a local environment. Keep internal, admin, and payment webhook secrets private.
 
-```bash
-python -m pytest -q
-python -m compileall -q app alembic tests seed.py
-```
-
-Загрузка производится клиентом напрямую в SeaweedFS по presigned URL. При завершении
-загрузки API ставит задачу в Redis/ARQ; worker проверяет длительность видео,
-перекодирует его в H.264, формирует постер и приводит фото/видео к формату 9:16.
-Для локального запуска `S3_ENDPOINT` должен указывать на SeaweedFS внутри Compose
-(`http://seaweedfs:9000`), а `S3_PUBLIC_ENDPOINT` — на адрес, доступный браузеру
-(`http://localhost:9000`). При переходе со старой конфигурации замените
-`S3_ENDPOINT=http://minio:9000` в локальном `.env` на
-`S3_ENDPOINT=http://seaweedfs:9000`.
-
-SeaweedFS автоматически создаёт бакет из `S3_BUCKET` и использует значения
-`S3_ACCESS_KEY` / `S3_SECRET_KEY` как S3-учётные данные. CORS настроен для локальных
-frontend-origin `localhost:3000` и `localhost:5173`. Интерфейсы доступны на
-`http://localhost:9333` (master) и `http://localhost:8888` (filer).
-
-Seed-скрипт не удаляет существующие данные и безопасно завершается, если демо-пользователь
-уже создан. Перед запуском seed необходимо применить все миграции.
+The included demo seed data and mock payment flow are intended for development, not production.

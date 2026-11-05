@@ -15,7 +15,7 @@ from app.core.config import settings
 from app.db.session import engine
 from app.services.s3_service import s3_service
 
-app = FastAPI(title="Avito Svayp API", version="0.1.0")
+app = FastAPI(title="SwipeMarket API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_ORIGIN],
