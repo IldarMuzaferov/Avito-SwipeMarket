@@ -69,7 +69,7 @@ class Reel(Base):
     __tablename__ = "reels"
     __table_args__ = (Index("idx_reels_status_published", "status", "published_at"),)
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    listing_id = Column(UUID(as_uuid=True), ForeignKey("listings.id"), unique=True)
+    listing_id = Column(UUID(as_uuid=True), ForeignKey("listings.id"))
     seller_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     status = Column(String, default="draft")
     media_type = Column(String)

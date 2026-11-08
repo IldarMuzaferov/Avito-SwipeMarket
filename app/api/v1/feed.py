@@ -20,6 +20,7 @@ from app.schemas.feed import (
     SwipeOut,
 )
 from app.services.recommender import recommend
+from app.services.s3_service import s3_service
 
 router = APIRouter()
 
@@ -52,16 +53,21 @@ async def build_feed_item(
         .where(ReelMedia.reel_id == reel.id)
         .order_by(ReelMedia.position, ReelMedia.id)
     )
-    media_items = [
-        MediaItem(
-            url=item.url,
-            poster=item.poster_url,
-            duration_sec=item.duration_sec,
-            width=item.width,
-            height=item.height,
+    media_items = []
+    for item in media_result.all():
+        media_items.append(
+            MediaItem(
+                url=await s3_service.get_file_url(item.url),
+                poster=(
+                    await s3_service.get_file_url(item.poster_url)
+                    if item.poster_url
+                    else None
+                ),
+                duration_sec=item.duration_sec,
+                width=item.width,
+                height=item.height,
+            )
         )
-        for item in media_result.all()
-    ]
     in_wishlist = False
     if user_id:
         in_wishlist = bool(

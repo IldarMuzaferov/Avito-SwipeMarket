@@ -56,6 +56,7 @@ async def start_upload(
         status="created"
     )
     session.add(upload)
+    await session.flush()
 
     res_files = []
     for pos, f in enumerate(data.files):
@@ -151,9 +152,9 @@ async def get_upload_status(
 
     file_list = []
     for f in files:
-        url = s3_service.get_file_url(f.storage_key)
-        if f.poster_storage_key:
-            url = s3_service.get_file_url(f.poster_storage_key)
+        url = await s3_service.get_file_url(
+            f.poster_storage_key or f.storage_key
+        )
         file_list.append({
             "file_id": str(f.id),
             "preview_url": url,
@@ -253,13 +254,14 @@ async def get_my_listings(
 
     res = []
     for l in listings:
-        reel_res = await session.execute(select(Reel).where(Reel.listing_id == l.id))
-        has_reel = reel_res.scalar_one_or_none() is not None
+        reel_id = await session.scalar(
+            select(Reel.id).where(Reel.listing_id == l.id).limit(1)
+        )
         res.append(ListingOut(
             id=str(l.id),
             title=l.title,
             price=l.price_amount,
-            has_reel=has_reel
+            has_reel=reel_id is not None
         ))
     return res
 
@@ -279,13 +281,6 @@ async def create_reel(
         raise HTTPException(status_code=403, detail={"code": "forbidden", "message": "Not your listing"})
     if listing.status != "active":
         raise HTTPException(status_code=409, detail={"code": "listing_unavailable", "message": "Listing is no longer available"})
-
-    # Проверка: один рилс на объявление
-    existing = await session.execute(
-        select(Reel).where(Reel.listing_id == listing.id)
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail={"code": "validation_error", "message": "Reel already exists for this listing"})
 
     upload = await session.get(MediaUpload, data.upload_id)
     if not upload or upload.user_id != user.id:
@@ -313,7 +308,7 @@ async def create_reel(
         media_type=media_type,
         show_price=data.show_price,
         description=data.description,
-        cover_url=s3_service.get_file_url(files[0].poster_storage_key or files[0].storage_key),
+        cover_url=files[0].poster_storage_key or files[0].storage_key,
         enabled=True,
         published_at=datetime.now(timezone.utc) if status_str == "published" else None
     )
@@ -321,13 +316,13 @@ async def create_reel(
 
     # Добавляем элементы медиа
     for pos, f in enumerate(files):
-        url = s3_service.get_file_url(f.storage_key)
+        url = f.storage_key
         rm = ReelMedia(
             id=uuid4(),
             reel_id=reel.id,
             kind="video" if upload.kind == "video" else "photo",
             url=url,
-            poster_url=s3_service.get_file_url(f.poster_storage_key) if f.poster_storage_key else None,
+            poster_url=f.poster_storage_key,
             duration_sec=f.duration_sec,
             width=1080,
             height=1920,
@@ -344,7 +339,7 @@ async def create_reel(
         media_type=reel.media_type,
         show_price=reel.show_price,
         description=reel.description,
-        cover_url=reel.cover_url,
+        cover_url=await s3_service.get_file_url(reel.cover_url) if reel.cover_url else None,
         enabled=reel.enabled,
         published_at=reel.published_at
     )
@@ -418,7 +413,7 @@ async def get_my_reels(
             listing_id=str(listing.id),
             title=listing.title,
             price=listing.price_amount,
-            cover_url=reel.cover_url,
+            cover_url=await s3_service.get_file_url(reel.cover_url) if reel.cover_url else None,
             status=reel.status,
             reject_reason=reel.reject_reason,
             stats=stats,
@@ -485,7 +480,7 @@ async def update_reel(
         media_type=reel.media_type,
         show_price=reel.show_price,
         description=reel.description,
-        cover_url=reel.cover_url,
+        cover_url=await s3_service.get_file_url(reel.cover_url) if reel.cover_url else None,
         enabled=reel.enabled,
         published_at=reel.published_at,
     )

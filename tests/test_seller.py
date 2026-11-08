@@ -1,7 +1,7 @@
 from uuid import UUID
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.db.models import Category, Listing, MediaFile, MediaUpload, Reel, User
 from app.main import app
@@ -37,9 +37,12 @@ async def test_upload_and_create_reel(client, monkeypatch):
     async def head(key):
         return {"ContentLength": 123, "ContentType": "video/mp4"}
 
+    async def file_url(key):
+        return f"https://cdn.test/{key}"
+
     monkeypatch.setattr(seller_api.s3_service, "generate_presigned_url", presigned)
     monkeypatch.setattr(seller_api.s3_service, "head_object", head)
-    monkeypatch.setattr(seller_api.s3_service, "get_file_url", lambda key: f"https://cdn.test/{key}")
+    monkeypatch.setattr(seller_api.s3_service, "get_file_url", file_url)
 
     class Queue:
         async def enqueue_job(self, name, upload_id):
@@ -112,6 +115,51 @@ async def test_upload_and_create_reel(client, monkeypatch):
     assert patch.status_code == 200
     assert patch.json()["description"] == "Обновлено"
 
+    async with app.state.test_session_factory() as session:
+        second_upload = MediaUpload(
+            id=UUID("d0000000-0000-4000-8000-000000000001"),
+            user_id=seller_id,
+            kind="video",
+            status="ready",
+        )
+        session.add(second_upload)
+        await session.flush()
+        session.add(
+            MediaFile(
+                id=UUID("d0000000-0000-4000-8000-000000000002"),
+                upload_id=second_upload.id,
+                filename="second.mp4",
+                content_type="video/mp4",
+                size_bytes=123,
+                storage_key="videos/second.mp4",
+                status="ready",
+                duration_sec=20,
+                position=0,
+            )
+        )
+        await session.commit()
+
+    listings = await client.get("/api/v1/me/listings", headers=headers)
+    assert listings.status_code == 200
+    assert listings.json()[0]["has_reel"] is True
+
+    second_reel = await client.post(
+        "/api/v1/reels",
+        headers=headers,
+        json={
+            "listing_id": str(listing_id),
+            "upload_id": "d0000000-0000-4000-8000-000000000001",
+            "show_price": True,
+            "description": "Второй рилс",
+        },
+    )
+    assert second_reel.status_code == 201
+    async with app.state.test_session_factory() as session:
+        reel_count = await session.scalar(
+            select(func.count(Reel.id)).where(Reel.listing_id == listing_id)
+        )
+        assert reel_count == 2
+
 
 @pytest.mark.asyncio
 async def test_upload_validation(client):
@@ -129,3 +177,34 @@ async def test_upload_validation(client):
     )
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "too_large"
+
+
+@pytest.mark.asyncio
+async def test_photo_upload_persists_upload_before_files(client, monkeypatch):
+    auth = await client.post("/api/v1/auth/guest", json={})
+    headers = {"Authorization": f"Bearer {auth.json()['access_token']}"}
+
+    from app.api.v1 import seller as seller_api
+
+    async def presigned(key, content_type, expires_in=3600):
+        return "https://storage.test/presigned"
+
+    monkeypatch.setattr(seller_api.s3_service, "generate_presigned_url", presigned)
+    response = await client.post(
+        "/api/v1/media/uploads",
+        headers=headers,
+        json={
+            "kind": "photos",
+            "files": [
+                {"filename": "photo.png", "content_type": "image/png", "size_bytes": 100}
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    upload_id = UUID(response.json()["upload_id"])
+    async with app.state.test_session_factory() as session:
+        upload = await session.get(MediaUpload, upload_id)
+        media = await session.scalar(select(MediaFile).where(MediaFile.upload_id == upload_id))
+        assert upload is not None
+        assert media is not None

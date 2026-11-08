@@ -1,4 +1,5 @@
 from pathlib import PurePath
+from urllib.parse import unquote, urlsplit
 
 import aioboto3
 
@@ -66,8 +67,27 @@ class S3Service:
         async with self._client(self.endpoint) as client:
             await client.delete_object(Bucket=self.bucket, Key=key)
 
-    def get_file_url(self, key: str) -> str:
-        return f"{settings.S3_PUBLIC_ENDPOINT.rstrip('/')}/{self.bucket}/{key}"
+    async def get_file_url(self, key: str, expires_in: int = 3600) -> str:
+        parsed = urlsplit(key)
+        if parsed.scheme and parsed.netloc:
+            public_endpoint = urlsplit(self.public_endpoint)
+            if (
+                parsed.scheme != public_endpoint.scheme
+                or parsed.netloc != public_endpoint.netloc
+            ):
+                return key
+            path = unquote(parsed.path).lstrip("/")
+            bucket_prefix = f"{self.bucket}/"
+            if not path.startswith(bucket_prefix):
+                return key
+            key = path[len(bucket_prefix):]
+
+        async with self._client(self.public_endpoint) as client:
+            return await client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.bucket, "Key": key},
+                ExpiresIn=expires_in,
+            )
 
 
 def get_s3_key(upload_id: str, file_id: str, filename: str, kind: str) -> str:

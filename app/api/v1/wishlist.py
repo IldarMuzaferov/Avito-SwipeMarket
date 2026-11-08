@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import and_, delete, func, or_, select
 from app.core.config import settings
 from app.db.session import get_db
+from app.services.s3_service import s3_service
 from app.schemas.wishlist import (
     WishlistResponse, WishlistItemOut, WishlistShareOut, WishlistPrice,
     AddWishlistItemIn, ShareToggleIn, PublicWishlistResponse, PublicWishlistOwner,
@@ -90,7 +91,11 @@ async def get_wishlist(
         elif listing.status == "removed":
             status_str = "removed"
 
-        cover_url = reel.cover_url if reel else None
+        cover_url = (
+            await s3_service.get_file_url(reel.cover_url)
+            if reel and reel.cover_url
+            else None
+        )
 
         items.append(WishlistItemOut(
             listing_id=str(listing.id),
@@ -140,7 +145,10 @@ async def add_wishlist_item(
 
     # Находим связанный рилс если есть
     reel_res = await session.execute(
-        select(Reel).where(Reel.listing_id == listing_uuid)
+        select(Reel)
+        .where(Reel.listing_id == listing_uuid)
+        .order_by(Reel.published_at.desc().nullslast(), Reel.created_at.desc())
+        .limit(1)
     )
     reel = reel_res.scalar_one_or_none()
 
@@ -323,7 +331,11 @@ async def get_public_wishlist(
         if listing.status in ("sold", "removed"):
             status_str = "sold"  # Друг видит все проданное/снятое как sold ("Уже купили")
 
-        cover_url = reel.cover_url if reel else None
+        cover_url = (
+            await s3_service.get_file_url(reel.cover_url)
+            if reel and reel.cover_url
+            else None
+        )
 
         items.append(PublicWishlistItemOut(
             listing_id=str(listing.id),
