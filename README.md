@@ -1,91 +1,332 @@
-# SwipeMarket
+# SwipeMarket — «Свайп» для Авито
 
-Backend API for a marketplace discovery experience built around short product videos and swipe-based browsing. Sellers can create video or photo reels for listings; buyers can discover products, save favorites, and share wishlists.
+SwipeMarket — демонстрационный проект маркетплейса, в котором покупатели находят товары в вертикальной ленте коротких видео и фотографий, а продавцы создают рилсы для своих объявлений. Понравившиеся товары можно добавить в вишлист и поделиться им по ссылке.
 
-The project is a FastAPI service with background media processing and a Docker Compose setup for local development.
+В репозитории находятся backend на FastAPI, frontend на React и TypeScript, Docker Compose-конфигурация локальных зависимостей и демонстрационные изображения интерфейса.
 
-## Features
+> Проект предназначен для разработки и демонстрации. Интеграции оплаты и часть пользовательских данных являются демонстрационными; перед эксплуатацией в production необходимы отдельная настройка безопасности, хранилища и инфраструктуры.
 
-- Guest and demo authentication, user profiles, categories, and onboarding interests.
-- Personalized product feed with swipe actions, undo, and recommendation signals.
-- Seller listings and reels, including direct-to-storage uploads using presigned URLs.
-- Background media processing with FFmpeg: video validation and transcoding, poster generation, and portrait formatting.
-- Wishlists with public sharing links.
-- Promotion plans, mock payments, and payment webhook handling.
-- Internal listing updates and administrative reel moderation.
+## Возможности
 
-## Tech stack
+### Для покупателей
 
-- **Python 3.12** and **FastAPI**
-- **PostgreSQL** with SQLAlchemy and Alembic
-- **Redis** and **ARQ** for background jobs
-- **SeaweedFS** for local S3-compatible media storage
-- **FFmpeg** for media processing
-- **Docker Compose** for local development
+- Лента рилсов с видео, фотографиями и фотоальбомами.
+- Персонализация ленты по выбранным категориям.
+- Управление лентой свайпами и кнопками: понравилось, не интересно, пропустить и отменить последнее действие.
+- Добавление товара в вишлист.
+- Публичный вишлист, которым можно поделиться по ссылке.
 
-## Getting started
+### Для продавцов
 
-### Requirements
+- Загрузка видео или до 10 фотографий для рилса.
+- Загрузка файлов напрямую в S3-совместимое хранилище по временной подписанной ссылке.
+- Фоновая проверка и обработка медиа: ограничение длительности, конвертация видео, создание постера и подготовка вертикального формата.
+- Кадрирование, изменение порядка фотографий и предпросмотр рилса.
+- Несколько рилсов для одного объявления.
+- Статусы модерации, статистика просмотров и лайков, демонстрационное продвижение.
 
-- Docker Desktop with Docker Compose
-- Git
+### Для разработки и администрирования
 
-### Run locally
+- Гостевая и демонстрационная авторизация с ролями покупателя, друга и продавца.
+- REST API и интерактивная документация OpenAPI.
+- Сервисные endpoints для внутреннего обновления объявления и модерации рилсов.
+- Демонстрационные данные и тесты backend.
 
-Clone the repository and enter its directory:
+## Скриншоты
+
+В репозитории есть иллюстрации интерфейса из папки `DemoPic`.
+
+<details>
+<summary>Открыть галерею</summary>
+
+### Главная страница и переход в «Свайп»
+
+![Кнопка «Свайп» в интерфейсе](<DemoPic/Иллюстрация кнопки свайп в интерфейс - Свайп — Авито.png>)
+
+### Лента видео и управление свайпами
+
+![Видео в ленте](<DemoPic/Иллюстрация отображения видео - Свайп — Авито.png>)
+
+![Подсказка по управлению лентой](<DemoPic/Иллюстрация подсказки - Свайп — Авито.png>)
+
+![Добавление товара в вишлист свайпом](<DemoPic/Иллюстрация добавление в вишлист - Свайп — Авито.jpg>)
+
+### Настройка рекомендаций
+
+![Выбор интересов для рекомендаций](<DemoPic/Иллюстрация настройки рекомендаций - Свайп — Авито.png>)
+
+### Создание и отображение рилсов
+
+![Создание рилса продавцом](<DemoPic/Иллюстрация публикации свайп - Свайп — Авито.png>)
+
+![Список публикаций продавца](<DemoPic/Иллюстрация отображения публикаций - Свайп — Авито.png>)
+
+### Вишлисты
+
+![Вишлист другого пользователя](<DemoPic/Иллюстрация отображения вишлиста друга - Свайп — Авито.png>)
+
+![Вишлист и настройки доступа по ссылке](<DemoPic/Иллюстрация вишлиста и настройки доступа по ссылке - Свайп — Авито.png>)
+
+</details>
+
+## Технологии
+
+| Часть | Технологии |
+|---|---|
+| Backend API | Python 3.12, FastAPI, Pydantic |
+| База данных | PostgreSQL 15, SQLAlchemy async, Alembic |
+| Фоновые задачи | Redis 7, ARQ |
+| Медиа | SeaweedFS (S3 API), FFmpeg |
+| Frontend | React 18, TypeScript, Vite, React Router |
+| Локальная среда | Docker Compose |
+
+## Требования
+
+- Git.
+- Docker Desktop с Docker Compose.
+- Node.js 18 или новее и npm — для запуска frontend вне Docker.
+
+Backend, PostgreSQL, Redis и SeaweedFS запускаются через Docker. Python на хост-компьютере нужен только для запуска backend-тестов вне контейнера.
+
+## Быстрый запуск
+
+### 1. Получить проект
 
 ```bash
 git clone https://github.com/IldarMuzaferov/SwipeMarket.git
 cd SwipeMarket
 ```
 
-Create a local environment file, then start the services:
+### 2. Настроить локальное окружение и запустить backend
+
+В PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
 docker compose up --build -d
+docker compose exec api alembic upgrade head
 ```
 
-On macOS or Linux, use `cp .env.example .env` instead of `Copy-Item`.
-
-Apply database migrations and optionally load demo data:
+В macOS/Linux:
 
 ```bash
+cp .env.example .env
+docker compose up --build -d
 docker compose exec api alembic upgrade head
+```
+
+После запуска API будет доступен на `http://localhost:8000`.
+
+### 3. Запустить frontend
+
+Откройте **второй** терминал в корне репозитория.
+
+В PowerShell:
+
+```powershell
+Set-Location avito-swipe-web
+Copy-Item .env.example .env
+npm install
+npm run dev
+```
+
+В macOS/Linux:
+
+```bash
+cd avito-swipe-web
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Откройте **http://localhost:3000**. Используйте именно `localhost`, а не `127.0.0.1`: backend по умолчанию разрешает CORS для `http://localhost:3000`. Порт frontend закреплён в `vite.config.ts`; если он занят, остановите другой процесс, использующий порт 3000.
+
+### 4. Добавить демонстрационные данные (необязательно)
+
+После миграций выполните:
+
+```bash
 docker compose exec api python seed.py
 ```
 
-The seed script adds sample users, listings, reels, and categories. It is safe to rerun: if demo data already exists, it makes no changes.
+Seed добавляет примеры пользователей, категорий, объявлений, рилсов, вишлиста и тарифов. Повторный запуск не добавляет данные повторно, если seed уже существует. Примеры URL некоторых медиа в seed — заглушки `cdn.example.com`; для проверки реальной загрузки используйте форму продавца и загрузите свои фото или видео.
 
-The API is available at [http://localhost:8000](http://localhost:8000).
+## Приложение и демонстрационные роли
 
-## API documentation
+Основные страницы frontend:
 
-- Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
-- OpenAPI schema: [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json)
-- Liveness check: [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health)
-- Dependency readiness: [http://localhost:8000/api/v1/ready](http://localhost:8000/api/v1/ready)
+| URL | Назначение |
+|---|---|
+| `/` | Главная страница |
+| `/onboarding` | Выбор интересов для рекомендаций |
+| `/swipe` | Лента рилсов |
+| `/my/wishlist` | Личный вишлист и настройки доступа |
+| `/wishlist/:token` | Публичный вишлист по ссылке |
+| `/seller/reel` | Создание рилса |
+| `/seller/listings` | Рилсы и объявления продавца |
 
-All application endpoints use the `/api/v1` prefix. Authenticated endpoints expect a bearer access token in the `Authorization` header. See Swagger UI for request schemas and authentication details.
+При первом открытии frontend автоматически создаёт гостевого пользователя. Чтобы переключиться на демонстрационную роль, нажмите на аватар в правом верхнем углу и выберите **«Демо: войти как»**. Для публикации рилса используйте роль продавца.
 
-## Media uploads
+## API и сервисы
 
-The client uploads media directly to the S3-compatible storage using a presigned URL. The API queues completed uploads for the ARQ worker, which processes videos and images in the background.
+| Сервис | Адрес |
+|---|---|
+| Frontend | http://localhost:3000 |
+| API | http://localhost:8000 |
+| Swagger UI | http://localhost:8000/docs |
+| OpenAPI JSON | http://localhost:8000/openapi.json |
+| Проверка API | http://localhost:8000/api/v1/health |
+| Готовность зависимостей | http://localhost:8000/api/v1/ready |
+| SeaweedFS S3 API | http://localhost:9000 |
+| SeaweedFS filer UI | http://localhost:8888 |
+| SeaweedFS master UI | http://localhost:9333 |
 
-In the provided Docker Compose setup, the API and worker use the internal storage endpoint (`http://seaweedfs:9000`), while browser clients use the public endpoint (`http://localhost:9000`). The local storage console is available at [http://localhost:8888](http://localhost:8888); the SeaweedFS master UI is at [http://localhost:9333](http://localhost:9333).
+Маршруты приложения используют префикс `/api/v1`. Аутентифицированные endpoints принимают bearer token в заголовке `Authorization`. Полные схемы запросов и ответов доступны в Swagger UI.
 
-## Tests
+Основные группы API:
 
-Run the test suite inside the API container:
+- `/auth`, `/users`, `/categories` — авторизация, профиль и рекомендации.
+- `/feed`, `/swipes`, `/reels`, `/listings` — лента, действия покупателя и карточки товара.
+- `/media/uploads`, `/me/listings`, `/me/reels` — загрузка медиа и инструменты продавца.
+- `/wishlist`, `/public/wishlists` — личные и публичные вишлисты.
+- `/promotion`, `/promotions`, `/payments` — тарифы и демонстрационный процесс продвижения.
+- `/internal` и `/admin` — внутренние операции и модерация.
+
+## Как устроена загрузка медиа
+
+1. Frontend запрашивает у API временный URL для загрузки.
+2. Браузер загружает файл напрямую в SeaweedFS, не пересылая его через API.
+3. API ставит задачу обработки в Redis/ARQ.
+4. Worker проверяет и обрабатывает изображение или видео с помощью FFmpeg, затем сохраняет результат и постер в SeaweedFS.
+5. API возвращает frontend подписанные ссылки для отображения медиа. Для локальной конфигурации они действуют один час.
+
+В `S3_ENDPOINT` указывают внутренний адрес хранилища, доступный API и worker из Docker-сети. `S3_PUBLIC_ENDPOINT` — адрес, доступный браузеру. В локальном Compose это соответственно `http://seaweedfs:9000` и `http://localhost:9000`. Если меняете порты или домены, обновите оба значения согласованно.
+
+## Конфигурация
+
+Корневой `.env.example` — шаблон настроек Docker Compose и backend. Скопируйте его в `.env` перед запуском. Файл `.env` игнорируется Git и не должен попадать в коммиты.
+
+| Переменная | Назначение |
+|---|---|
+| `DATABASE_URL` | URL подключения к PostgreSQL |
+| `REDIS_URL` | URL Redis для фоновой очереди |
+| `S3_ENDPOINT` | Внутренний endpoint S3 для API и worker |
+| `S3_PUBLIC_ENDPOINT` | Публичный endpoint S3 для браузера и подписанных ссылок |
+| `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Учётные данные локального S3-хранилища |
+| `S3_BUCKET` | Имя bucket |
+| `SECRET_KEY`, `ALGORITHM` | Подпись токенов авторизации |
+| `AUTO_PUBLISH` | Автоматически публиковать рилсы или отправлять на модерацию |
+| `FRONTEND_ORIGIN` | Разрешённый CORS origin frontend |
+| `PUBLIC_BASE_URL` | Публичный URL backend |
+| `INTERNAL_API_KEY`, `ADMIN_API_KEY` | Ключи внутренних и административных endpoints |
+| `PAYMENT_WEBHOOK_SECRET` | Секрет проверки webhook оплаты |
+| `MOCK_PAYMENT_BASE_URL` | Базовый URL демонстрационной оплаты |
+| `SQL_ECHO` | Включить SQL-логи при разработке |
+
+Frontend использует собственный файл `avito-swipe-web/.env`:
+
+```env
+VITE_API_URL=http://localhost:8000/api/v1
+```
+
+Для другого адреса API измените `VITE_API_URL` в `avito-swipe-web/.env` и перезапустите Vite.
+
+## Разработка frontend
+
+Команды выполняются из папки `avito-swipe-web`:
+
+```bash
+npm install
+npm run dev
+npm run typecheck
+npm run build
+```
+
+`npm run build` создаёт production-сборку в `dist/`. `npm run preview` запускает локальный просмотр собранного frontend.
+
+## Миграции и тесты
+
+Применить миграции в Docker-БД:
+
+```bash
+docker compose exec api alembic upgrade head
+```
+
+Запустить тесты backend в контейнере:
 
 ```bash
 docker compose exec api python -m pytest -q
 ```
 
-The tests use an isolated SQLite database and do not require a separate test PostgreSQL instance.
+Тесты используют изолированную SQLite-БД и не требуют отдельного тестового PostgreSQL. Если Python и зависимости backend настроены локально, запустить тесты из корня можно так:
 
-## Configuration and security
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
 
-Use `.env.example` as the starting point for local configuration. The `.env` file is ignored by Git and must not be committed. Replace development keys and credentials before deploying anywhere beyond a local environment. Keep internal, admin, and payment webhook secrets private.
+## Структура репозитория
 
-The included demo seed data and mock payment flow are intended for development, not production.
+```text
+.
+├── app/
+│   ├── api/v1/          # HTTP endpoints
+│   ├── core/            # конфигурация и безопасность
+│   ├── db/              # SQLAlchemy-модели и подключение к БД
+│   ├── schemas/          # Pydantic-схемы API
+│   ├── services/         # хранилище и рекомендации
+│   └── worker/           # фоновые задачи обработки медиа
+├── alembic/              # миграции PostgreSQL
+├── tests/                # тесты backend
+├── avito-swipe-web/
+│   └── src/
+│       ├── api/          # API-клиент и TypeScript-типы
+│       ├── components/   # переиспользуемые React-компоненты
+│       ├── lib/          # загрузка файлов и утилиты
+│       ├── pages/        # страницы приложения
+│       └── styles/       # CSS
+├── DemoPic/              # изображения интерфейса для README
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+└── seed.py
+```
+
+## Полезные команды Docker
+
+```bash
+docker compose ps
+docker compose logs -f api worker
+docker compose logs -f postgres redis seaweedfs
+docker compose restart api worker
+docker compose down
+```
+
+`docker compose down` останавливает сервисы, сохраняя данные в именованных томах. Команда `docker compose down -v` также удаляет тома с локальной базой данных и медиа; используйте её только если действительно хотите сбросить локальные данные.
+
+## Устранение неполадок
+
+- **Не открывается `localhost:8000`** — проверьте, что Docker Desktop запущен, затем выполните `docker compose ps` и `docker compose logs -f api`.
+- **API не готов после первого запуска** — примените миграции командой `docker compose exec api alembic upgrade head`.
+- **Frontend не может обратиться к API** — откройте `http://localhost:3000`, проверьте `VITE_API_URL` и значение `FRONTEND_ORIGIN` в корневом `.env`.
+- **Браузер не загружает файл в S3** — проверьте доступность `S3_PUBLIC_ENDPOINT`, CORS SeaweedFS для origin frontend и bucket. Для локального Compose разрешены `localhost:3000` и `localhost:5173`.
+- **Фото/видео не отображается** — проверьте `docker compose logs -f worker`, статус загрузки через API и доступность SeaweedFS. Ссылки на медиа подписываются и истекают через час; обновите страницу или заново запросите данные из API.
+- **Порт уже занят** — освободите порт `8000`, `5432`, `6379`, `9000` или `3000`, либо измените mapping портов в Compose и соответствующие адреса в `.env`.
+
+## Безопасность
+
+Значения в `.env.example` предназначены только для локальной разработки. Перед любым внешним развертыванием задайте уникальные секреты и пароли, ограничьте доступ к PostgreSQL, Redis и SeaweedFS, настройте HTTPS и проверьте доступность внутренних и административных endpoints. Не публикуйте `.env`, реальные ключи, пароли или пользовательские файлы.
+
+## Публикация проекта на GitHub
+
+Изменения README, frontend и иллюстраций сохранены в Git-коммите. Чтобы отправить текущую ветку `master` в уже настроенный remote `origin`, выполните из корня репозитория:
+
+```bash
+git push -u origin master
+```
+
+Если GitHub отклонит push из-за коммитов, которых ещё нет локально, сначала синхронизируйте ветку:
+
+```bash
+git pull --rebase origin master
+git push -u origin master
+```
